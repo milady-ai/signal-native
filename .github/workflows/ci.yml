@@ -1,0 +1,208 @@
+name: CI
+
+env:
+  DEBUG: napi:*
+  APP_NAME: signal-native
+  MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ["**"]
+    paths-ignore: ["**/*.md", LICENSE]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: npx napi build --platform --release --target x86_64-pc-windows-msvc
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            build: npx napi build --platform --release --target x86_64-apple-darwin
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            build: npx napi build --platform --release --target aarch64-apple-darwin
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: npx napi build --platform --release --target x86_64-unknown-linux-gnu --use-napi-cross
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: npx napi build --platform --release --target aarch64-unknown-linux-gnu --use-napi-cross
+
+    name: Build - ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            .cargo-cache
+            target/
+          key: ${{ matrix.settings.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.settings.target }}-cargo-
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build native module
+        run: ${{ matrix.settings.build }}
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: ${{ env.APP_NAME }}.*.node
+          if-no-files-found: error
+
+  test-host:
+    name: Test - ${{ matrix.settings.target }} - node@${{ matrix.node }}
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+          - host: macos-latest
+            target: aarch64-apple-darwin
+          - host: macos-latest
+            target: x86_64-apple-darwin
+        node: ["20", "22"]
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: .
+
+      - name: List bindings
+        run: ls -la *.node
+        shell: bash
+
+      - name: Test bindings
+        run: npm test
+
+  test-linux:
+    name: Test - ${{ matrix.target }} - node@${{ matrix.node }}
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+        node: ["20", "22"]
+    runs-on: ${{ contains(matrix.target, 'aarch64') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: .
+
+      - name: List bindings
+        run: ls -la *.node
+
+      - name: Test bindings
+        run: npm test
+
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [build, test-host, test-linux]
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Create npm platform dirs
+        run: npx napi create-npm-dirs
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Move artifacts
+        run: npx napi artifacts
+
+      - name: List packages
+        run: ls -R npm/
+        shell: bash
+
+      - name: Publish
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          if echo "$COMMIT_MSG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            npm publish --access public --provenance
+          elif echo "$COMMIT_MSG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            npm publish --access public --provenance --tag next
+          else
+            echo "Not a release commit, skipping publish"
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
