@@ -1,0 +1,53 @@
+{
+  "name": "@milady/signal-native",
+  "version": "0.1.0",
+  "description": "Native Node.js Signal client — baileys for Signal. Rust (Presage) + napi-rs bindings.",
+  "license": "AGPL-3.0-only",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/milady-ai/signal-native.git"
+  },
+  "keywords": [
+    "signal",
+    "signal-protocol",
+    "messaging",
+    "presage",
+    "napi",
+    "native"
+  ],
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "napi": {
+    "binaryName": "signal-native",
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "prepublishOnly": "napi prepublish -t npm",
+    "test": "node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0"
+  },
+  "optionalDependencies": {
+    "@milady/signal-native-win32-x64-msvc": "0.1.0",
+    "@milady/signal-native-darwin-arm64": "0.1.0",
+    "@milady/signal-native-darwin-x64": "0.1.0",
+    "@milady/signal-native-linux-x64-gnu": "0.1.0",
+    "@milady/signal-native-linux-arm64-gnu": "0.1.0"
+  }
+}
