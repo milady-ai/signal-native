@@ -225,6 +225,11 @@ async function main() {
   });
 
   await receiveMessages();
+
+  // receiveMessages() resolves immediately (spawns a background Rust thread).
+  // Keep the Node event loop alive so the callback can fire.
+  // The SIGINT handler above will call process.exit() on Ctrl+C.
+  await new Promise(() => {}); // never resolves — hangs until SIGINT
 }
 
 main().catch((err) => {
