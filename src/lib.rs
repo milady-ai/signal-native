@@ -67,9 +67,46 @@ where
 }
 
 async fn open_store(data_path: &str) -> napi::Result<SqliteStore> {
+    // Ensure parent directory exists
+    let db_path = std::path::Path::new(data_path);
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            napi::Error::from_reason(format!(
+                "Failed to create parent dir {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    // Workaround: bundled SQLCipher's create_if_missing doesn't work on Windows.
+    // Pre-create the database file via raw sqlite3_open_v2 so sqlx can open it.
+    if data_path != ":memory:" && !db_path.exists() {
+        unsafe {
+            let c_path = std::ffi::CString::new(data_path)
+                .map_err(|e| napi::Error::from_reason(format!("Invalid path: {e}")))?;
+            let mut db: *mut libsqlite3_sys::sqlite3 = std::ptr::null_mut();
+            let flags = libsqlite3_sys::SQLITE_OPEN_READWRITE
+                | libsqlite3_sys::SQLITE_OPEN_CREATE;
+            let rc = libsqlite3_sys::sqlite3_open_v2(
+                c_path.as_ptr(),
+                &mut db,
+                flags,
+                std::ptr::null(),
+            );
+            if !db.is_null() {
+                libsqlite3_sys::sqlite3_close(db);
+            }
+            if rc != libsqlite3_sys::SQLITE_OK {
+                return Err(napi::Error::from_reason(format!(
+                    "Failed to create database at {data_path} (sqlite3 error {rc})"
+                )));
+            }
+        }
+    }
+
     SqliteStore::open(data_path, OnNewIdentity::Trust)
         .await
-        .map_err(|e| napi::Error::from_reason(format!("Failed to open store at {data_path}: {e}")))
+        .map_err(|e| napi::Error::from_reason(format!("Failed to open store at {data_path}: {e:#}")))
 }
 
 async fn get_or_create_manager(
@@ -170,9 +207,33 @@ pub async fn link_device(data_path: String, device_name: String) -> napi::Result
             .build()
             .unwrap();
         rt.block_on(async move {
+            // Ensure parent directory exists
+            let db_path = std::path::Path::new(&dp);
+            if let Some(parent) = db_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Pre-create database file (bundled SQLCipher workaround)
+            if !db_path.exists() {
+                unsafe {
+                    let c_path = std::ffi::CString::new(dp.as_str()).unwrap();
+                    let mut db: *mut libsqlite3_sys::sqlite3 = std::ptr::null_mut();
+                    let flags = libsqlite3_sys::SQLITE_OPEN_READWRITE
+                        | libsqlite3_sys::SQLITE_OPEN_CREATE;
+                    let rc = libsqlite3_sys::sqlite3_open_v2(
+                        c_path.as_ptr(),
+                        &mut db,
+                        flags,
+                        std::ptr::null(),
+                    );
+                    if !db.is_null() { libsqlite3_sys::sqlite3_close(db); }
+                    if rc != libsqlite3_sys::SQLITE_OK {
+                        return Err(format!("Failed to create database (sqlite3 error {rc})"));
+                    }
+                }
+            }
             let store = SqliteStore::open(&dp, OnNewIdentity::Trust)
                 .await
-                .map_err(|e| format!("Store error: {e}"))?;
+                .map_err(|e| format!("Store error: {e:#}"))?;
             Manager::link_secondary_device(
                 store,
                 SignalServers::Production,
@@ -180,7 +241,7 @@ pub async fn link_device(data_path: String, device_name: String) -> napi::Result
                 url_tx,
             )
             .await
-            .map_err(|e| format!("Linking error: {e}"))
+            .map_err(|e| format!("Linking error: {e:#}"))
         })
     });
 
@@ -557,6 +618,60 @@ pub async fn get_profile(data_path: String) -> napi::Result<JsProfile> {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Diagnostic: try opening a store and report detailed error.
+#[napi]
+pub async fn test_store_open(data_path: String) -> napi::Result<String> {
+    presage_spawn(move || async move {
+        eprintln!("[test] CWD: {:?}", std::env::current_dir());
+        eprintln!("[test] TEMP: {:?}", std::env::temp_dir());
+
+        // Test raw C sqlite3 API
+        eprintln!("[test] Testing raw sqlite3_open_v2({data_path})...");
+        unsafe {
+            let c_path = std::ffi::CString::new(data_path.as_str()).unwrap();
+            let mut db: *mut libsqlite3_sys::sqlite3 = std::ptr::null_mut();
+            let flags = libsqlite3_sys::SQLITE_OPEN_READWRITE
+                | libsqlite3_sys::SQLITE_OPEN_CREATE;
+            let rc = libsqlite3_sys::sqlite3_open_v2(
+                c_path.as_ptr(),
+                &mut db,
+                flags,
+                std::ptr::null(),
+            );
+            if rc == libsqlite3_sys::SQLITE_OK {
+                eprintln!("[test] Raw sqlite3_open_v2 succeeded!");
+                libsqlite3_sys::sqlite3_close(db);
+            } else {
+                let errmsg = libsqlite3_sys::sqlite3_errmsg(db);
+                let errmsg_str = if errmsg.is_null() {
+                    "null".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(errmsg).to_string_lossy().to_string()
+                };
+                eprintln!("[test] Raw sqlite3_open_v2 failed: rc={rc}, msg={errmsg_str}");
+                if !db.is_null() {
+                    libsqlite3_sys::sqlite3_close(db);
+                }
+            }
+        }
+
+        // Try SqliteStore
+        eprintln!("[test] Trying SqliteStore::open({data_path})...");
+        match SqliteStore::open(&data_path, OnNewIdentity::Trust).await {
+            Ok(_) => {
+                eprintln!("[test] SqliteStore::open succeeded!");
+                Ok("Store opened successfully".to_string())
+            }
+            Err(e) => {
+                let msg = format!("Store open error: {e:#}");
+                eprintln!("[test] {msg}");
+                Err(napi::Error::from_reason(msg))
+            }
+        }
+    })
+    .await
+}
 
 fn content_to_js_message(
     content: &presage::libsignal_service::content::Content,
