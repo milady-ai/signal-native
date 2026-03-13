@@ -22,6 +22,14 @@ use presage::Manager;
 use presage_store_sqlite::{OnNewIdentity, SqliteStore};
 use tokio::sync::{watch, Mutex};
 
+/// Initialize Rust logger (env_logger). Safe to call multiple times.
+fn init_logger() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = env_logger::try_init();
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
@@ -197,6 +205,7 @@ pub struct JsIncomingMessage {
 /// Call `finishLink()` after the user scans the QR code.
 #[napi]
 pub async fn link_device(data_path: String, device_name: String) -> napi::Result<String> {
+    init_logger();
     let dp = data_path.clone();
     let (url_tx, url_rx) = futures::channel::oneshot::channel();
 
