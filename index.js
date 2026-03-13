@@ -37,7 +37,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./signal-native.win32-x64-msvc.node')
           } else {
-            nativeBinding = require('@milady/signal-native-win32-x64-msvc')
+            nativeBinding = require('signal-native-win32-x64-msvc')
           }
         } catch (e) {
           loadError = e
@@ -55,7 +55,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./signal-native.darwin-x64.node')
           } else {
-            nativeBinding = require('@milady/signal-native-darwin-x64')
+            nativeBinding = require('signal-native-darwin-x64')
           }
         } catch (e) {
           loadError = e
@@ -67,7 +67,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./signal-native.darwin-arm64.node')
           } else {
-            nativeBinding = require('@milady/signal-native-darwin-arm64')
+            nativeBinding = require('signal-native-darwin-arm64')
           }
         } catch (e) {
           loadError = e
@@ -85,7 +85,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./signal-native.linux-x64-gnu.node')
           } else {
-            nativeBinding = require('@milady/signal-native-linux-x64-gnu')
+            nativeBinding = require('signal-native-linux-x64-gnu')
           }
         } catch (e) {
           loadError = e
@@ -97,7 +97,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./signal-native.linux-arm64-gnu.node')
           } else {
-            nativeBinding = require('@milady/signal-native-linux-arm64-gnu')
+            nativeBinding = require('signal-native-linux-arm64-gnu')
           }
         } catch (e) {
           loadError = e
