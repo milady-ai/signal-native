@@ -39,7 +39,6 @@ type LinkResult = Result<RegisteredManager, String>;
 
 struct ManagerEntry {
     manager: RegisteredManager,
-    cancel_tx: Option<watch::Sender<bool>>,
 }
 
 static MANAGERS: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<Mutex<ManagerEntry>>>>> =
@@ -48,6 +47,11 @@ static MANAGERS: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<Mutex<ManagerEn
 static LINK_HANDLES: once_cell::sync::Lazy<
     Mutex<HashMap<String, tokio::task::JoinHandle<LinkResult>>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Separate storage for receive-loop cancel channels.
+/// Avoids opening a manager (and thus a second DB connection) just to store cancel_tx.
+static RECV_CANCEL: once_cell::sync::Lazy<Mutex<HashMap<String, watch::Sender<bool>>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -130,10 +134,7 @@ async fn get_or_create_manager(
         .await
         .map_err(|e| napi::Error::from_reason(format!("Failed to load registered manager: {e}")))?;
 
-    let entry = Arc::new(Mutex::new(ManagerEntry {
-        manager,
-        cancel_tx: None,
-    }));
+    let entry = Arc::new(Mutex::new(ManagerEntry { manager }));
     managers.insert(data_path.to_string(), entry.clone());
     Ok(entry)
 }
@@ -278,10 +279,7 @@ pub async fn finish_link(data_path: String) -> napi::Result<()> {
         .map_err(|e| napi::Error::from_reason(format!("Task error: {e}")))?
         .map_err(|e| napi::Error::from_reason(format!("Linking failed: {e}")))?;
 
-    let entry = Arc::new(Mutex::new(ManagerEntry {
-        manager,
-        cancel_tx: None,
-    }));
+    let entry = Arc::new(Mutex::new(ManagerEntry { manager }));
     MANAGERS.lock().await.insert(data_path, entry);
 
     Ok(())
@@ -389,8 +387,8 @@ pub async fn send_group_message(
 // Receiving messages
 // ---------------------------------------------------------------------------
 
-/// Start receiving messages. Creates a dedicated manager instance for receiving
-/// (separate from sending) so both can operate concurrently on the same store.
+/// Start receiving messages. Spawns a dedicated thread with its own manager
+/// and tokio runtime (Presage futures are !Send).
 #[napi]
 pub async fn receive_messages(
     data_path: String,
@@ -399,88 +397,103 @@ pub async fn receive_messages(
         ErrorStrategy::Fatal,
     >,
 ) -> napi::Result<()> {
-    // Ensure send manager entry exists (for cancel_tx storage)
-    let entry = get_or_create_manager(&data_path).await?;
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    entry.lock().await.cancel_tx = Some(cancel_tx);
+    RECV_CANCEL.lock().await.insert(data_path.clone(), cancel_tx);
 
     let dp = data_path.clone();
 
-    // Spawn receive loop on dedicated thread with its own manager
+    // Spawn receive loop on a dedicated thread.
+    // Wrapped in catch_unwind to prevent native panics from aborting the Node process.
     tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let store = match SqliteStore::open(&dp, OnNewIdentity::Trust).await {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("[signal-native] Failed to open recv store: {e}");
-                    return;
-                }
-            };
-            let mut recv_manager: RegisteredManager = match Manager::load_registered(store).await {
-                Ok(m) => m,
-                Err(e) => {
-                    log::error!("[signal-native] Failed to load recv manager: {e}");
-                    return;
-                }
-            };
-
-            let messages = match recv_manager.receive_messages().await {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("[signal-native] Failed to start receiving: {e}");
-                    return;
-                }
-            };
-            pin_mut!(messages);
-            let mut cancel_rx = cancel_rx;
-
-            loop {
-                tokio::select! {
-                    _ = cancel_rx.changed() => {
-                        if *cancel_rx.borrow() {
-                            log::info!("[signal-native] Receive loop cancelled for {dp}");
-                            break;
-                        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let store = match open_store(&dp).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[signal-native] Failed to open recv store: {e}");
+                        return;
                     }
-                    item = messages.next() => {
-                        match item {
-                            Some(Received::QueueEmpty) => {
-                                callback.call(
-                                    JsIncomingMessage {
-                                        sender_uuid: String::new(),
-                                        timestamp: 0.0,
-                                        text: None,
-                                        group_id: None,
-                                        is_reaction: false,
-                                        reaction_emoji: None,
-                                        reaction_target_timestamp: None,
-                                        attachments: vec![],
-                                        is_queue_empty: true,
-                                    },
-                                    ThreadsafeFunctionCallMode::NonBlocking,
-                                );
-                            }
-                            Some(Received::Contacts) => {
-                                log::info!("[signal-native] Contacts synchronized");
-                            }
-                            Some(Received::Content(content)) => {
-                                if let Some(msg) = content_to_js_message(&content) {
-                                    callback.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
-                                }
-                            }
-                            None => {
-                                log::info!("[signal-native] Stream ended for {dp}");
+                };
+                let mut recv_manager: RegisteredManager = match Manager::load_registered(store).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("[signal-native] Failed to load recv manager: {e}");
+                        return;
+                    }
+                };
+
+                eprintln!("[signal-native] Receive manager loaded, starting stream...");
+
+                let messages = match recv_manager.receive_messages().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[signal-native] Failed to start receiving: {e}");
+                        return;
+                    }
+                };
+                pin_mut!(messages);
+                let mut cancel_rx = cancel_rx;
+
+                eprintln!("[signal-native] Receive stream active, listening for messages...");
+
+                loop {
+                    tokio::select! {
+                        _ = cancel_rx.changed() => {
+                            if *cancel_rx.borrow() {
+                                eprintln!("[signal-native] Receive loop cancelled for {dp}");
                                 break;
                             }
                         }
+                        item = messages.next() => {
+                            match item {
+                                Some(Received::QueueEmpty) => {
+                                    callback.call(
+                                        JsIncomingMessage {
+                                            sender_uuid: String::new(),
+                                            timestamp: 0.0,
+                                            text: None,
+                                            group_id: None,
+                                            is_reaction: false,
+                                            reaction_emoji: None,
+                                            reaction_target_timestamp: None,
+                                            attachments: vec![],
+                                            is_queue_empty: true,
+                                        },
+                                        ThreadsafeFunctionCallMode::NonBlocking,
+                                    );
+                                }
+                                Some(Received::Contacts) => {
+                                    eprintln!("[signal-native] Contacts synchronized");
+                                }
+                                Some(Received::Content(content)) => {
+                                    if let Some(msg) = content_to_js_message(&content) {
+                                        callback.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
+                                    }
+                                }
+                                None => {
+                                    eprintln!("[signal-native] Stream ended for {dp}");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
-            }
-        });
+            });
+        }));
+        if let Err(panic) = result {
+            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            eprintln!("[signal-native] PANIC in receive thread: {msg}");
+        }
     });
 
     Ok(())
@@ -489,12 +502,8 @@ pub async fn receive_messages(
 /// Stop the receive loop for the given data path.
 #[napi]
 pub async fn stop_receiving(data_path: String) -> napi::Result<()> {
-    let managers = MANAGERS.lock().await;
-    if let Some(entry) = managers.get(&data_path) {
-        let mut guard = entry.lock().await;
-        if let Some(tx) = guard.cancel_tx.take() {
-            let _ = tx.send(true);
-        }
+    if let Some(tx) = RECV_CANCEL.lock().await.remove(&data_path) {
+        let _ = tx.send(true);
     }
     Ok(())
 }

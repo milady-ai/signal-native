@@ -214,6 +214,14 @@ async function main() {
   console.log("\nStarting message listener...");
   console.log("Send a message to this device from another Signal client to test.\n");
 
+  // Detect unexpected exit
+  process.on("exit", (code) => {
+    if (code !== 0) console.error(`\n[exit] Process exiting with code ${code}`);
+  });
+  process.on("uncaughtException", (err) => {
+    console.error("[uncaught]", err);
+  });
+
   // Handle Ctrl+C gracefully
   process.on("SIGINT", async () => {
     console.log("\n\nStopping receiver...");
@@ -227,9 +235,9 @@ async function main() {
   await receiveMessages();
 
   // receiveMessages() resolves immediately (spawns a background Rust thread).
-  // Keep the Node event loop alive so the callback can fire.
-  // The SIGINT handler above will call process.exit() on Ctrl+C.
-  await new Promise(() => {}); // never resolves — hangs until SIGINT
+  // Node exits when there are no active libuv handles — a pending promise
+  // is NOT enough. Keep stdin open so the event loop stays alive.
+  process.stdin.resume();
 }
 
 main().catch((err) => {
