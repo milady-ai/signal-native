@@ -1,7 +1,6 @@
 # @milady/signal-native
 
-Native Node.js Signal client — **baileys for Signal**.
-
+Native Node.js Signal client 
 Wraps the [Presage](https://github.com/whisperfish/presage) Rust library with [napi-rs](https://napi.rs) bindings, providing a zero-dependency Signal messaging client for Node.js. No Docker, no Java, no signal-cli — just install and use.
 
 ## Features
